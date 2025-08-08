@@ -12,17 +12,13 @@ import {
   getChatById,
   getComplaintById,
   getMessagesByChatId,
-  saveChat,
-  saveComplaintDetails,
   saveMessages,
   submitComplaint,
+  updateChatTitle,
+  updateChatIsDraft,
 } from '@/lib/db/queries';
 import { convertToUIMessages, generateUUID } from '@/lib/utils';
-import { checkComplaintReadiness, generateTitleFromUserMessage } from '../../actions';
-import { createDocument } from '@/lib/ai/tools/create-document';
-import { updateDocument } from '@/lib/ai/tools/update-document';
-import { requestSuggestions } from '@/lib/ai/tools/request-suggestions';
-import { getWeather } from '@/lib/ai/tools/get-weather';
+import { assignComplaintToEmployee, checkComplaintReadiness, generateTitleFromUserMessage, predictComplaintCategory } from '../../actions';
 import { myProvider } from '@/lib/ai/providers';
 import { postRequestBodySchema, type PostRequestBody } from './schema';
 import {
@@ -90,7 +86,13 @@ export async function POST(request: Request) {
     }
 
     // Check if complaint exists
-    const complaint = await getComplaintById(complaintId);
+    let complaint = await getComplaintById(complaintId);
+    let complaintReadiness: { 
+      isReady: boolean; 
+      description: string; 
+      additionalDetails?: string; 
+      desiredResolution?: string; 
+    } | null = null;
     console.log('Complaint details:', complaint);
 
     if (!complaint) {
@@ -99,19 +101,6 @@ export async function POST(request: Request) {
     }
 
     const chat = await getChatById({ id });
-
-    if (!chat) {
-      const title = await generateTitleFromUserMessage({
-        message,
-      });
-
-      await saveChat({
-        id,
-        userId: session.user.id,
-        userType: session.user.type,
-        title,
-      });
-    }
 
     const messagesFromDb = await getMessagesByChatId({ id });
     const uiMessages = [...convertToUIMessages(messagesFromDb), message];
@@ -136,15 +125,52 @@ export async function POST(request: Request) {
     const stream = createUIMessageStream({
       execute: async ({ writer: dataStream }) => {
 
+        // Send title update event if title was updated
+        if (chat.title === 'New Chat') {
+          const title = await generateTitleFromUserMessage({
+            message,
+          });
+
+          console.log('Title generated:', title);
+
+          if (title) {
+            await updateChatTitle({
+              id,
+              title,
+            });
+  
+            // Send title update event to client
+            dataStream.write({
+              type: 'data-title',
+              data: title,
+            });
+          }
+        }
+
         // Only check readiness if the complaint is still a draft
         if (complaint && complaint.isDraft) {
-          const complaintReadiness = await checkComplaintReadiness(complaintId, uiMessages);
+          complaintReadiness = await checkComplaintReadiness(complaintId, uiMessages);
+          complaint = await getComplaintById(complaintId);
           console.log('Complaint readiness:', complaintReadiness);
 
           if (complaintReadiness?.isReady) {
             try {
-              await submitComplaint({ id: complaintId });
+              const categoryPrediction = await predictComplaintCategory(uiMessages);
+              console.log('Category prediction:', categoryPrediction);
+              await submitComplaint({ 
+                id: complaintId, 
+                category: categoryPrediction?.category,
+                description: complaintReadiness.description,
+                additionalDetails: complaintReadiness.additionalDetails,
+                desiredResolution: complaintReadiness.desiredResolution,
+                sentiment: categoryPrediction?.sentiment
+              });
+              complaint = await getComplaintById(complaintId);
+              await updateChatIsDraft({ id, isDraft: false });
               console.log('Complaint submitted successfully:', complaintId);
+              console.log('Complaint details:', complaint);
+              console.log('Routing the complaint to the support team...');
+              assignComplaintToEmployee(complaintId);
             } catch (error) {
               console.error('Error submitting complaint:', error);
             }
@@ -157,7 +183,25 @@ export async function POST(request: Request) {
           model: myProvider.languageModel(selectedChatModel),
           system: `${customerComplaintPrompt}
 
-IMPORTANT: When providing the complaint reference number after the complaint is submitted, use this exact reference number: ${complaint?.referenceNumber || 'PENDING'}
+CURRENT DATE AND TIME CONTEXT:
+Current Date: ${new Date().toLocaleDateString('en-US', { 
+  weekday: 'long', 
+  year: 'numeric', 
+  month: 'long', 
+  day: 'numeric' 
+})}
+Current Time: ${new Date().toLocaleTimeString('en-US', { 
+  hour: '2-digit', 
+  minute: '2-digit',
+  timeZoneName: 'short'
+})}
+
+When customers mention relative dates like "yesterday", "last week", "two days ago", etc., calculate the actual date based on the current date above. Always convert relative dates to specific dates (e.g., "January 15, 2024") in your responses and complaint registration.
+
+IMPORTANT: Check if the complaint reference number is generated and provided below after the complaint submission. If it's not null then only tell the customer the reference number.
+Also check if the complaint is ready to submit. If the complaint readiness is not true yet, then do not show the reference number. Only show once both are truthy.
+Complaint Reference Number: ${complaint?.referenceNumber}
+Complaint Readiness: ${complaintReadiness?.isReady}
 
 Do not generate or make up any other reference numbers. Use only the provided reference number above.`,
           messages: convertToModelMessages(uiMessages),
@@ -222,3 +266,5 @@ Do not generate or make up any other reference numbers. Use only the provided re
     }
   }
 }
+
+
